@@ -496,6 +496,9 @@ static int compare_logits(const ActivationTensors *a, const ActivationTensors *b
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer even when stdout is a pipe (e.g. `| tee`) --
+                                          otherwise glibc fully-buffers non-TTY stdout and this
+                                          whole ~90min run's output sits invisible until exit */
 #ifdef _OPENMP
     printf("Built WITH OpenMP -- max threads = %d (set OMP_NUM_THREADS to control)\n", omp_get_max_threads());
 #else

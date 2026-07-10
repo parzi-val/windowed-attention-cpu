@@ -500,6 +500,9 @@ static int compare_logits(const ActivationTensors *a, const ActivationTensors *b
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer even when stdout is a pipe (e.g. `| tee`) --
+                                          otherwise glibc fully-buffers non-TTY stdout and a long
+                                          run's output sits invisible until exit */
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
     int L = model.config.num_layers, NH = model.config.num_heads;

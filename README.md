@@ -62,6 +62,23 @@ On Windows with clang targeting MSVC, drop `-lm` (its math functions are already
 clang -O2 -std=c11 -o gpt2_forward_windowed.exe gpt2_forward_windowed.c
 ```
 
+### Multi-core (OpenMP)
+
+`gpt2_forward_windowed.c` is deliberately serial throughout (matches Karpathy's "clean,
+minimal, readable" reference and avoids attributing any of the numbers above to threading
+variance). `gpt2_forward_windowed_omp.c` is the same three-arm forward pass with `#pragma
+omp parallel for` added to every layer -- not just the matmuls (the dominant cost), since
+threading only the biggest piece just promotes the next-biggest to new-biggest (Amdahl's
+law). Same four parity gates; if they fail under OpenMP but passed serially, that's a race
+condition to chase before trusting any timing:
+
+```
+gcc -O2 -fopenmp -std=c11 -o gpt2_forward_windowed_omp gpt2_forward_windowed_omp.c -lm
+OMP_NUM_THREADS=4 ./gpt2_forward_windowed_omp
+```
+
+Builds fine without `-fopenmp` too (falls back to serial, same file either way).
+
 If you didn't clone with `--recurse-submodules`: `git submodule update --init`.
 
 ## What this does and doesn't tell you

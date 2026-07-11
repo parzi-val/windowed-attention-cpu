@@ -1,26 +1,36 @@
-/* gpt2_forward_windowed_omp.c -- same three-arm (dense/map/allwindow) full GPT-2 forward
- * pass as gpt2_forward_windowed.c, with OpenMP added to every hot loop, to test whether
- * threading changes the full-model story now that we know naive matmul (not attention)
- * dominates FLOPs at this model size. Kept as a SEPARATE file rather than a flag on the
- * original, so the serial version stays the untouched, already-parity-gated baseline and
- * this one is a clean A/B against it, not a modification with two code paths tangled
- * together.
+/* gpt2_forward_windowed_blas.c -- same three-arm (dense/map/allwindow) full GPT-2 forward
+ * pass, with matmul_forward backed by a real BLAS (cblas_sgemm) instead of the naive
+ * triple loop. Attention (the actual experimental variable) stays our own hand-rolled
+ * kernels, unchanged from gpt2_forward_windowed.c -- only the boring, dominant-but-not-
+ * what-we're-testing matmul cost gets replaced.
  *
- * Threaded: encoder_forward, layernorm_forward, matmul_forward (the dominant cost),
- * attention_forward, attention_forward_perhead, gelu_forward, residual_forward -- every
- * layer, not just matmul, so a serial bottleneck in some other layer doesn't cap the
- * speedup once matmul itself is no longer the limiter (Amdahl's law: threading only the
- * biggest piece just promotes the next-biggest piece to new-biggest).
+ * Why: excluding PyTorch from these benchmarks was about avoiding its dispatch/generation
+ * overhead (Python object churn, autograd bookkeeping, framework call overhead per op),
+ * not about avoiding optimized numerical libraries in general -- no real deployment stack
+ * ships a naive triple-loop matmul either. The naive version answers "does windowing help
+ * on top of an artificially slow matmul baseline," which understates windowing's value
+ * (a slow, identical-cost-for-every-arm matmul inflates the portion of total time that
+ * windowing can't touch). This variant is the closer-to-real-deployment comparison point.
  *
- * Builds fine WITHOUT -fopenmp too (falls back to serial, #ifdef-guarded) -- so the same
- * file works for a clean single-flag A/B if you want one.
+ * Architecture code (encoder/layernorm/gelu/residual, struct layout, checkpoint format,
+ * dense attention_forward) is adapted from Andrej Karpathy's llm.c
+ * (https://github.com/karpathy/llm.c, MIT licensed). attention_forward_perhead is the
+ * same lazy-head-map-driven per-head dispatch as the other variants in this repo.
  *
- * Build:
- *     gcc -O2 -fopenmp -o gpt2_forward_windowed_omp gpt2_forward_windowed_omp.c -lm
- *     OMP_NUM_THREADS=4 ./gpt2_forward_windowed_omp
+ * Build (needs an OpenBLAS dev package):
+ *     Linux/Colab/Lightning:  sudo apt-get install -y libopenblas-dev
+ *                             gcc -O2 -std=c11 -o gpt2_forward_windowed_blas \
+ *                                 gpt2_forward_windowed_blas.c -lopenblas -lm
+ *     macOS (Accelerate, no OpenBLAS install needed):
+ *                             clang -O2 -std=c11 -DACCELERATE_NEW_LAPACK \
+ *                                 -o gpt2_forward_windowed_blas gpt2_forward_windowed_blas.c \
+ *                                 -framework Accelerate
  *
- * Needs the same three files as gpt2_forward_windowed.c (gpt2_124M.bin,
- * gpt2_124M_fwd_state.bin, gpt2_124M_lazymap.bin -- see export_gpt2_c.py).
+ * OpenBLAS multi-threads matmul internally by default -- control it with
+ * OPENBLAS_NUM_THREADS=N, independent of anything in this file.
+ *
+ * Needs, in the same directory: gpt2_124M.bin, gpt2_124M_fwd_state.bin, gpt2_124M_lazymap.bin
+ * (all produced by export_gpt2_c.py).
  */
 #define _CRT_SECURE_NO_WARNINGS
 #include <stdio.h>
@@ -29,8 +39,10 @@
 #include <math.h>
 #include <time.h>
 #include <assert.h>
-#ifdef _OPENMP
-#include <omp.h>
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
 #endif
 
 #define SINK 4
@@ -69,17 +81,10 @@ static double now_sec(void) {
 }
 
 /* ---------------------------------------------------------------------------
- * Layers -- same math as gpt2_forward_windowed.c, with #pragma omp parallel for added.
- * Every loop body writes to a disjoint (b,t[,h]) output slice per iteration, so collapsing
- * the (b,t) loops is safe with no race conditions and no reduction needed. VLAs and other
- * loop-local arrays declared inside the parallelized body are automatically private per
- * thread (they're stack-local to each iteration), so nothing extra is needed for those.
+ * Layers.
  * ------------------------------------------------------------------------- */
 static void encoder_forward(float *out, const int *inp, const float *wte, const float *wpe,
                              int B, int T, int C) {
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             float *out_bt = out + b * T * C + t * C;
@@ -94,9 +99,6 @@ static void encoder_forward(float *out, const int *inp, const float *wte, const 
 static void layernorm_forward(float *out, const float *inp, const float *weight, const float *bias,
                                int B, int T, int C) {
     float eps = 1e-5f;
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             const float *x = inp + b * T * C + t * C;
@@ -115,19 +117,20 @@ static void layernorm_forward(float *out, const float *inp, const float *weight,
 
 static void matmul_forward(float *out, const float *inp, const float *weight, const float *bias,
                             int B, int T, int C, int OC) {
-    /* inp (B,T,C), weight (OC,C), bias (OC) -> out (B,T,OC). This is the dominant cost --
-     * the one loop where threading should matter most. */
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(static)
-#endif
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            int bt = b * T + t;
-            for (int o = 0; o < OC; o++) {
-                float val = (bias != NULL) ? bias[o] : 0.0f;
-                for (int i = 0; i < C; i++) val += inp[(size_t)bt * C + i] * weight[(size_t)o * C + i];
-                out[(size_t)bt * OC + o] = val;
-            }
+    /* inp (B,T,C) == (BT,C) row-major; weight (OC,C) row-major; out (BT,OC).
+     * out = inp @ weight^T via cblas_sgemm: op(A)=inp (BT,C) no-transpose, op(B)=weight^T
+     * (C,OC) -- weight itself is stored (OC,C), so TransB=Trans gives us its transpose as
+     * op(B). beta=0 since we're computing fresh, not accumulating; bias is added after in
+     * a cheap O(BT*OC) pass (trivial next to the O(BT*OC*C) matmul cost either way). */
+    int BT = B * T;
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                BT, OC, C,
+                1.0f, inp, C,
+                weight, C,
+                0.0f, out, OC);
+    if (bias != NULL) {
+        for (int bt = 0; bt < BT; bt++) {
+            for (int o = 0; o < OC; o++) out[(size_t)bt * OC + o] += bias[o];
         }
     }
 }
@@ -138,9 +141,6 @@ static void attention_forward(float *out, float *preatt, float *att, const float
     int C3 = C * 3;
     int hs = C / NH;
     float scale = 1.0f / sqrtf((float)hs);
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 4)
-#endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
@@ -180,18 +180,10 @@ static void attention_forward(float *out, float *preatt, float *att, const float
 
 static void attention_forward_perhead(float *out, const float *inp, int B, int T, int C, int NH,
                                        const int *head_windowed, int sink, int window) {
-    /* Per-head dispatch, same as gpt2_forward_windowed.c. Note the schedule(dynamic, 4):
-     * dense heads at large t (VLA branch, O(t) work) and windowed heads (O(sink+window)
-     * work, ~constant) do very different amounts of work per iteration, and a map mixes
-     * both kinds of heads within the same t -- dynamic scheduling avoids one thread getting
-     * stuck with a disproportionate share of the expensive dense-head iterations. */
     int C3 = C * 3;
     int hs = C / NH;
     float scale = 1.0f / sqrtf((float)hs);
 
-#ifdef _OPENMP
-    #pragma omp parallel for collapse(2) schedule(dynamic, 4)
-#endif
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             int win_lo = t - window + 1;
@@ -233,7 +225,7 @@ static void attention_forward_perhead(float *out, const float *inp, int B, int T
                     }
                 } else {
                     int n = t + 1;
-                    float scores[n]; /* VLA -- automatic/stack, private per thread by construction */
+                    float scores[n]; /* VLA, C99: n <= T, fine on the stack for our tested T */
                     float maxval = -1e9f;
                     for (int s = 0; s < n; s++) {
                         const float *key_s = inp + (size_t)b * T * C3 + (size_t)s * C3 + h * hs + C;
@@ -262,9 +254,6 @@ static void attention_forward_perhead(float *out, const float *inp, int B, int T
 
 static void gelu_forward(float *out, const float *inp, int N) {
     const float GELU_SCALE = 0.7978845608028654f;
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
     for (int i = 0; i < N; i++) {
         float x = inp[i];
         float cube = 0.044715f * x * x * x;
@@ -273,9 +262,6 @@ static void gelu_forward(float *out, const float *inp, int N) {
 }
 
 static void residual_forward(float *out, const float *inp1, const float *inp2, int N) {
-#ifdef _OPENMP
-    #pragma omp parallel for schedule(static)
-#endif
     for (int i = 0; i < N; i++) out[i] = inp1[i] + inp2[i];
 }
 
@@ -502,14 +488,7 @@ static int compare_logits(const ActivationTensors *a, const ActivationTensors *b
 }
 
 int main(void) {
-    setvbuf(stdout, NULL, _IOLBF, 0); /* line-buffer even when stdout is a pipe (e.g. `| tee`) --
-                                          otherwise glibc fully-buffers non-TTY stdout and this
-                                          whole ~90min run's output sits invisible until exit */
-#ifdef _OPENMP
-    printf("Built WITH OpenMP -- max threads = %d (set OMP_NUM_THREADS to control)\n", omp_get_max_threads());
-#else
-    printf("Built WITHOUT OpenMP -- serial (compile with -fopenmp for the threaded version)\n");
-#endif
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
     GPT2 model;
     gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
@@ -540,9 +519,9 @@ int main(void) {
         return 1;
     }
 
-    /* Same four parity gates as the serial version -- threading must not change the answer,
-     * only the wall-clock time. If these fail under OpenMP but passed serially, that's a
-     * race condition to chase before trusting any timing below. */
+    /* Same four parity gates as the other variants. The matmul swap is the one thing most
+     * likely to introduce a real bug here (row/col-major or transpose mixups are the
+     * classic cblas_sgemm mistake) -- these gates are exactly what would catch that. */
     ActivationTensors acts_d;
     float *mem_d;
     gpt2_forward(&model, x, B, T, NULL, &acts_d, &mem_d);

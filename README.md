@@ -77,6 +77,33 @@ gcc -O2 -fopenmp -std=c11 -o gpt2_forward_windowed_omp gpt2_forward_windowed_omp
 OMP_NUM_THREADS=4 ./gpt2_forward_windowed_omp
 ```
 
+### Realistic matmul (BLAS)
+
+The naive triple-loop `matmul_forward` in the two variants above answers "does windowing
+help on top of an artificially slow matmul" -- useful for isolating attention's own cost,
+but not representative of any real deployment, which would never ship an unoptimized
+matmul either. `gpt2_forward_windowed_blas.c` swaps `matmul_forward` for `cblas_sgemm`
+(OpenBLAS/Accelerate/MKL, anything providing the standard BLAS C API) and leaves the
+attention kernels -- the actual thing being tested -- untouched. This is the
+closer-to-real-deployment comparison point: excluding PyTorch was about avoiding its
+dispatch/generation overhead, not about avoiding optimized numerical libraries.
+
+```
+sudo apt-get install -y libopenblas-dev   # Linux/Colab/Lightning
+gcc -O2 -std=c11 -o gpt2_forward_windowed_blas gpt2_forward_windowed_blas.c -lopenblas -lm
+./gpt2_forward_windowed_blas
+```
+
+macOS needs no separate install (links against the system Accelerate framework instead):
+
+```
+clang -O2 -std=c11 -DACCELERATE_NEW_LAPACK -o gpt2_forward_windowed_blas \
+    gpt2_forward_windowed_blas.c -framework Accelerate
+```
+
+OpenBLAS threads internally by default -- control it with `OPENBLAS_NUM_THREADS=N`,
+independent of anything in this file.
+
 Builds fine without `-fopenmp` too (falls back to serial, same file either way).
 
 If you didn't clone with `--recurse-submodules`: `git submodule update --init`.

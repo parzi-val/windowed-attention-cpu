@@ -424,6 +424,12 @@ static int *load_lazy_map(const char *path, int L, int NH, int *sink_out, int *w
  * benchmark that sweeps multiple T values) -- allocation happens outside the timed region. */
 static void gpt2_forward(GPT2 *model, const int *inputs, int B, int T, const int *head_mask,
                           ActivationTensors *acts_out, float **acts_mem_out) {
+    if (T > model->config.max_seq_len) {
+        fprintf(stderr, "Error: T=%d exceeds max_seq_len=%d -- position embeddings only cover "
+                        "0..%d, this would silently read past the wpe buffer\n",
+                T, model->config.max_seq_len, model->config.max_seq_len - 1);
+        exit(1);
+    }
     size_t C = model->config.channels, NH = model->config.num_heads, L = model->config.num_layers,
            Vp = model->config.padded_vocab_size;
     for (int i = 0; i < B * T; i++) assert(0 <= inputs[i] && inputs[i] < (int)model->config.vocab_size);

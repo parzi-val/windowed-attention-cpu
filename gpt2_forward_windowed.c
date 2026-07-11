@@ -380,13 +380,12 @@ static void gpt2_build_from_checkpoint(GPT2 *model, const char *checkpoint_path)
     fclose(f);
 }
 
-#define LAZY_THRESHOLD 0.05f /* matches Definition 1 (windowing paper): delta_ppl < 0.05 -> lazy */
-
-/* Loads the per-(layer,head) causal compressibility map (export_gpt2_c.py, sourced from
- * head_compressibility_gpt2.json) and thresholds it into an L*NH windowed/dense mask -- the
- * actual paper claim (window the lazy heads, keep load-bearing heads dense), not just "some
- * heads windowed, some not" with no basis for which. */
-static int *load_lazy_map(const char *path, int L, int NH, int *sink_out, int *window_out) {
+/* Loads the raw per-(layer,head) causal compressibility scores (delta_ppl). Arms are built
+ * from FRACTIONS of this ranking (25/50/75% of heads, lowest delta_ppl first windowed) --
+ * the actual paper operating points -- not a fixed delta_ppl<0.05 threshold, which was a
+ * property of the map alone (80.6% for gpt2) and not what the paper's headline numbers
+ * report. */
+static float *load_delta_ppl(const char *path, int L, int NH, int *sink_out, int *window_out) {
     FILE *f = fopen_check(path, "rb");
     int header[256];
     fread_check(header, sizeof(int), 256, f);
@@ -402,15 +401,35 @@ static int *load_lazy_map(const char *path, int L, int NH, int *sink_out, int *w
     fread_check(delta_ppl, sizeof(float), (size_t)L * NH, f);
     fclose(f);
 
-    int *mask = (int *)malloc_check((size_t)L * NH * sizeof(int));
     int n_lazy = 0;
-    for (int i = 0; i < L * NH; i++) {
-        mask[i] = delta_ppl[i] < LAZY_THRESHOLD;
-        n_lazy += mask[i];
-    }
-    printf("[Map] %s: %d/%d heads lazy at delta_ppl<%.3f (sink=%d window=%d)\n",
-           path, n_lazy, L * NH, LAZY_THRESHOLD, *sink_out, *window_out);
-    free(delta_ppl);
+    for (int i = 0; i < L * NH; i++) if (delta_ppl[i] < 0.05f) n_lazy++;
+    printf("[Map] %s: %d/%d heads naturally lazy at delta_ppl<0.05 (sink=%d window=%d) -- "
+           "reference only; arms below use fixed fractions of the ranking, not this threshold\n",
+           path, n_lazy, L * NH, *sink_out, *window_out);
+    return delta_ppl;
+}
+
+typedef struct { float score; int idx; } ScoreIdx;
+static int cmp_score_idx(const void *a, const void *b) {
+    float sa = ((const ScoreIdx *)a)->score, sb = ((const ScoreIdx *)b)->score;
+    if (sa < sb) return -1;
+    if (sa > sb) return 1;
+    return 0;
+}
+
+/* Selects the frac*L*NH heads with the LOWEST delta_ppl (cheapest to window) -- same
+ * ranking as group_mask_from_scores throughout the rest of this research thread: sort
+ * ascending, take the first k. This IS the paper's operating-point construction. */
+static int *mask_from_fraction(const float *delta_ppl, int L, int NH, float frac) {
+    int total = L * NH;
+    ScoreIdx *si = (ScoreIdx *)malloc_check(sizeof(ScoreIdx) * total);
+    for (int i = 0; i < total; i++) { si[i].score = delta_ppl[i]; si[i].idx = i; }
+    qsort(si, total, sizeof(ScoreIdx), cmp_score_idx);
+    int k = (int)(frac * total + 0.5f);
+    int *mask = (int *)malloc_check(sizeof(int) * total);
+    for (int i = 0; i < total; i++) mask[i] = 0;
+    for (int i = 0; i < k; i++) mask[si[i].idx] = 1;
+    free(si);
     return mask;
 }
 
@@ -527,22 +546,29 @@ int main(void) {
     fclose(sf);
     int Vp = model.config.padded_vocab_size;
 
-    /* Build the three L*NH masks up front -- reused for both the parity gates and the
-     * timing sweep, so the gates test exactly the mask content that gets timed. */
     int *mask_dense = (int *)malloc_check((size_t)L * NH * sizeof(int));
     int *mask_allwindow = (int *)malloc_check((size_t)L * NH * sizeof(int));
     for (int i = 0; i < L * NH; i++) { mask_dense[i] = 0; mask_allwindow[i] = 1; }
     int map_sink, map_window;
-    int *mask_map = load_lazy_map("gpt2_124M_lazymap.bin", L, NH, &map_sink, &map_window);
+    float *delta_ppl = load_delta_ppl("gpt2_124M_lazymap.bin", L, NH, &map_sink, &map_window);
     if (map_sink != SINK || map_window != WINDOW) {
         fprintf(stderr, "Map was built with sink=%d window=%d, this file uses SINK=%d WINDOW=%d -- "
                         "re-run export_gpt2_c.py against a matching map, or edit the #defines.\n",
                 map_sink, map_window, SINK, WINDOW);
         return 1;
     }
+    int *mask_map25 = mask_from_fraction(delta_ppl, L, NH, 0.25f);
+    int *mask_map50 = mask_from_fraction(delta_ppl, L, NH, 0.50f);
+    int *mask_map75 = mask_from_fraction(delta_ppl, L, NH, 0.75f);
+    free(delta_ppl);
 
-    /* Gate 1: dense reference (head_mask=NULL, original attention_forward) vs real HF logits.
-     * This is the one path that never changes -- the trusted anchor for gates 2-4. */
+    struct { const char *name; const int *mask; } arms[5] = {
+        {"dense", mask_dense}, {"map25", mask_map25}, {"map50", mask_map50},
+        {"map75", mask_map75}, {"allwindow", mask_allwindow},
+    };
+
+    /* Dense reference (head_mask=NULL, original attention_forward) vs real HF logits. This
+     * is the one path that never changes -- the trusted anchor for the gates below. */
     ActivationTensors acts_d;
     float *mem_d;
     gpt2_forward(&model, x, B, T, NULL, &acts_d, &mem_d);
@@ -556,21 +582,15 @@ int main(void) {
     int gate1_ok = max_diff_dense < 5e-2f; /* fp32 accumulation over 12 layers; matches llm.c's own 2e-2 tol order */
     printf(gate1_ok ? "PASSED.\n" : "FAILED -- do not trust anything below.\n");
 
-    /* Gates 2-4: attention_forward_perhead with each mask, on the SAME short prompt
-     * (T well under WINDOW=64), where windowing at any fraction is required to reduce to
-     * dense exactly -- so all three must match gate 1's reference. Gate 2 validates
-     * attention_forward_perhead's dense/VLA branch; gate 3 its windowed branch; gate 4 that
-     * the real map loads and threads through correctly end to end. */
-    struct { const char *name; const int *mask; } gates[3] = {
-        {"all-dense mask (validates perhead's dense branch)", mask_dense},
-        {"all-window mask (validates perhead's windowed branch)", mask_allwindow},
-        {"real lazy map (validates map load + threading)", mask_map},
-    };
+    /* All 5 arms vs the dense reference, on the SAME short prompt (T well under WINDOW=64),
+     * where windowing at any fraction is required to reduce to dense exactly -- validates
+     * attention_forward_perhead's dense and windowed branches, AND that the fraction-based
+     * masks (mask_from_fraction) select and thread through correctly. */
     int gates_ok = 1;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 5; i++) {
         ActivationTensors a; float *m;
-        gpt2_forward(&model, x, B, T, gates[i].mask, &a, &m);
-        printf("Gate %d (%s, T=%d < WINDOW=%d):\n", i + 2, gates[i].name, T, WINDOW);
+        gpt2_forward(&model, x, B, T, arms[i].mask, &a, &m);
+        printf("Gate (%s, T=%d < WINDOW=%d):\n", arms[i].name, T, WINDOW);
         int ok = compare_logits(&acts_d, &a, B, T, V, Vp);
         printf(ok ? "PASSED.\n" : "FAILED -- do not trust anything below.\n");
         gates_ok = gates_ok && ok;
@@ -581,26 +601,26 @@ int main(void) {
     free(mem_d); free(x); free(expected_logits);
     if (!gate1_ok || !gates_ok) return 1;
 
-    /* Timing sweep: full end-to-end forward pass, three arms, within GPT-2's own 1024-token
+    /* Timing sweep: full end-to-end forward pass, five arms, within GPT-2's own 1024-token
      * position-embedding ceiling. */
     int contexts[] = {128, 256, 512, 1024};
     int n_contexts = (int)(sizeof(contexts) / sizeof(contexts[0]));
     int warmup = 2, repeats = 5; /* full-model passes are much heavier than the isolated
                                     kernel benchmark -- fewer repeats to keep this practical */
-    struct { const char *name; const int *mask; } arms[3] = {
-        {"dense", mask_dense}, {"map", mask_map}, {"allwindow", mask_allwindow},
-    };
     unsigned int seed = 42;
     srand(seed);
 
-    printf("%-8s %14s %14s %14s %12s %12s\n", "T", "dense(ms)", "map(ms)", "allwin(ms)", "map_speedup", "allwin_speedup");
+    printf("%-6s", "T");
+    for (int a = 0; a < 5; a++) printf(" %11s(ms)", arms[a].name);
+    for (int a = 1; a < 5; a++) printf(" %10s_x", arms[a].name);
+    printf("\n");
     for (int ci = 0; ci < n_contexts; ci++) {
         int Tc = contexts[ci];
         int *ids = (int *)malloc_check((size_t)Tc * sizeof(int));
         for (int i = 0; i < Tc; i++) ids[i] = rand() % model.config.vocab_size;
 
-        double ms[3];
-        for (int a = 0; a < 3; a++) {
+        double ms[5];
+        for (int a = 0; a < 5; a++) {
             for (int i = 0; i < warmup; i++) {
                 ActivationTensors act; float *m;
                 gpt2_forward(&model, ids, 1, Tc, arms[a].mask, &act, &m);
@@ -615,12 +635,14 @@ int main(void) {
             ms[a] = (now_sec() - t0) / repeats * 1000.0;
         }
 
-        printf("%-8d %14.2f %14.2f %14.2f %11.2fx %13.2fx\n",
-               Tc, ms[0], ms[1], ms[2], ms[0] / ms[1], ms[0] / ms[2]);
+        printf("%-6d", Tc);
+        for (int a = 0; a < 5; a++) printf(" %15.2f", ms[a]);
+        for (int a = 1; a < 5; a++) printf(" %11.2fx", ms[0] / ms[a]);
+        printf("\n");
         free(ids);
     }
 
-    free(mask_dense); free(mask_allwindow); free(mask_map);
+    free(mask_dense); free(mask_map25); free(mask_map50); free(mask_map75); free(mask_allwindow);
     free(model.params_memory);
     return 0;
 }

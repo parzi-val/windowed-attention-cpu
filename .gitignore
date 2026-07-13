@@ -16,3 +16,7 @@ __pycache__/
 
 # CMake build directories
 build/
+build-android/
+
+# local ExecuTorch source checkout + NDK -- large build dependency, not tracked source (Phase 4)
+_build/

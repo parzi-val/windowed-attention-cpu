@@ -35,12 +35,19 @@ target_include_directories(windowed_sdpa_kv_cache_et_rt PRIVATE ${_et_inc})
 target_link_libraries(windowed_sdpa_kv_cache_et_rt PRIVATE windowed_sdpa_kv_cache_kernel_rt)
 target_compile_features(windowed_sdpa_kv_cache_et_rt PRIVATE cxx_std_20)
 
+# Standard-op kernel set: optimized_native_cpu_ops_lib (registration) + optimized_kernels
+# (SIMD implementations, backed by cpublas/eigen_blas) + portable_kernels as fallback for any
+# op without an optimized implementation -- the exact combination ExecuTorch's own reference
+# Llama CMakeLists.txt (examples/models/llama/CMakeLists.txt) uses for real inference, not the
+# portable-only set Phase 1-3 used for toy-model export-survival testing (where speed never
+# mattered). portable_kernels alone measured ~30s/decode-step on-device -- not remotely
+# representative of a real deployment number.
 add_executable(prefill_decode_runner prefill_decode_runner.cpp)
 target_include_directories(prefill_decode_runner PRIVATE ${_et_inc})
 target_compile_features(prefill_decode_runner PRIVATE cxx_std_20)
 target_link_libraries(prefill_decode_runner PRIVATE
   $<LINK_LIBRARY:WHOLE_ARCHIVE,windowed_sdpa_kv_cache_et_rt>
-  $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}portable_ops_lib${_s}>
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}optimized_native_cpu_ops_lib${_s}>
   "${_et_lib}/${_p}extension_module_static${_s}"
   "${_et_lib}/${_p}extension_tensor${_s}"
   $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}executorch${_s}>
@@ -48,7 +55,16 @@ target_link_libraries(prefill_decode_runner PRIVATE
   "${_et_lib}/${_p}extension_data_loader${_s}"
   "${_et_lib}/${_p}extension_flat_tensor${_s}"
   "${_et_lib}/${_p}extension_named_data_map${_s}"
+  "${_et_lib}/${_p}optimized_kernels${_s}"
   "${_et_lib}/${_p}portable_kernels${_s}"
+  "${_et_lib}/${_p}cpublas${_s}"
+  "${_et_lib}/${_p}eigen_blas${_s}"
+  "${_et_lib}/${_p}extension_threadpool${_s}"
+  "${_et_lib}/${_p}pthreadpool${_s}"
+  "${_et_lib}/${_p}cpuinfo${_s}"
   "${_et_lib}/${_p}kernels_util_all_deps${_s}"
   "${_et_lib}/${_p}flatccrt${_s}"
 )
+if(ANDROID)
+  target_link_libraries(prefill_decode_runner PRIVATE log)
+endif()

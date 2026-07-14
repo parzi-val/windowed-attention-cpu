@@ -15,56 +15,20 @@ dynamism axes showed dynamic start_pos alone (Tn=1 fixed) exports cleanly -- so:
 Random-init weights here -- this validates export mechanics (shapes/ops), not real generation
 quality; that comes from build_arms.py's arms + real pretrained weights on Colab in a later step.
 
+WindowedLlamaForExport is also imported directly (e.g. by compare_device_output.py) to build an
+eager reference model without re-running this whole export pipeline -- everything below the
+class/function definitions is guarded behind __main__ specifically so that import doesn't
+re-trigger a full weight load + export + to_executorch + .pte write as a side effect.
+
     .venv-executorch/Scripts/python.exe export_llama.py [--arm map50]
 """
-import argparse
-import json
 import sys
 
 import torch
 import torch.nn as nn
 from transformers.models.llama.modeling_llama import LlamaConfig, LlamaModel
 
-sys.path.insert(0, "../phase3_kv_cache/build")
-import windowed_sdpa_kv_cache_pybind as kernel_module  # noqa: E402
-
-from real_attention_patch import RealWindowedLlamaAttention, register_kernel_impl  # noqa: E402
-
-register_kernel_impl(kernel_module)
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--arm", default="map50", choices=["map25", "map50", "map75"])
-parser.add_argument("--max-prompt-len", type=int, default=64)
-parser.add_argument("--real-weights", action="store_true",
-                     help="Load real pretrained meta-llama/Llama-3.2-1B (needs HF auth + ~5GB "
-                          "download) instead of random-init -- for the Colab run that produces "
-                          "the actual on-device benchmark artifact.")
-args = parser.parse_args()
-
-arms_data = json.load(open("llama_3.2_1b_arms.json"))
-arm = arms_data["arms"][args.arm]
-head_windowed_per_layer = arm["head_windowed"]  # [L][n_heads] bool
-n_layers = arms_data["n_layers"]
-SINK, WINDOW = arms_data["sink"], arms_data["window"]
-MAX_T = args.max_prompt_len + 256  # room for prefill + a generation run, small for this exit gate
-
-if args.real_weights:
-    from transformers import AutoModelForCausalLM
-    print(f"Loading real pretrained meta-llama/Llama-3.2-1B with arm={args.arm} "
-          f"({sum(sum(r) for r in head_windowed_per_layer)}/{n_layers * 32} heads windowed)...")
-    base_model = AutoModelForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-1B", torch_dtype=torch.float32
-    ).model.eval()
-    assert base_model.config.num_hidden_layers == n_layers, "arms JSON layer count mismatch vs. real model"
-else:
-    print(f"Building Llama-3.2-1B (config only, random init) with arm={args.arm} "
-          f"({sum(sum(r) for r in head_windowed_per_layer)}/{n_layers * 32} heads windowed)...")
-    config = LlamaConfig(
-        vocab_size=128256, hidden_size=2048, intermediate_size=8192,
-        num_hidden_layers=n_layers, num_attention_heads=32, num_key_value_heads=8,
-        head_dim=64, max_position_embeddings=2048, rope_theta=500000.0,
-    )
-    base_model = LlamaModel(config).eval()
+from real_attention_patch import RealWindowedLlamaAttention  # noqa: E402
 
 
 class WindowedLlamaForExport(nn.Module):
@@ -76,6 +40,7 @@ class WindowedLlamaForExport(nn.Module):
         self.embed_tokens = base.embed_tokens
         self.rotary_emb = base.rotary_emb
         self.norm = base.norm
+        self.max_t = max_t
         self.layers = nn.ModuleList([
             RealWindowedLlamaAttention(
                 base.layers[l].self_attn, head_windowed_per_layer[l], sink, window, 1, max_t
@@ -93,7 +58,7 @@ class WindowedLlamaForExport(nn.Module):
         # value so it isn't baked in as a compile-time constant.
         start_pos = input_pos[0].item()
         torch._check_is_size(start_pos)
-        torch._check(start_pos < MAX_T)
+        torch._check(start_pos < self.max_t)
 
         seq_len = input_ids.shape[1]
         hidden = self.embed_tokens(input_ids)
@@ -113,7 +78,7 @@ class WindowedLlamaForExport(nn.Module):
         return self.norm(hidden)
 
 
-def check_mutation_markers(exported, name):
+def check_mutation_markers(exported, n_layers, name):
     sg_nodes = [n for n in exported.graph.nodes
                 if n.op == "call_function" and "windowed_sdpa_kv_cache" in str(n.target)]
     assert len(sg_nodes) == n_layers, f"[{name}] expected {n_layers} op call nodes, got {len(sg_nodes)}"
@@ -123,64 +88,117 @@ def check_mutation_markers(exported, name):
     print(f"   [{name}] {len(sg_nodes)}/{n_layers} op nodes present, all carry k_cache/v_cache mutation markers")
 
 
-model = WindowedLlamaForExport(base_model, head_windowed_per_layer, SINK, WINDOW, MAX_T).eval()
-vocab_size, hidden_size = base_model.config.vocab_size, base_model.config.hidden_size
+if __name__ == "__main__":
+    import argparse
+    import json
 
-prefill_inputs = (
-    torch.randint(0, vocab_size, (1, args.max_prompt_len)),
-    torch.zeros(1, dtype=torch.long),  # start_pos = 0, always -- prefill is a fresh generation
-)
-decode_inputs = (
-    torch.randint(0, vocab_size, (1, 1)),
-    torch.tensor([args.max_prompt_len], dtype=torch.long),  # example start_pos, made dynamic below
-)
+    sys.path.insert(0, "../phase3_kv_cache/build")
+    import windowed_sdpa_kv_cache_pybind as kernel_module  # noqa: E402
+    from real_attention_patch import register_kernel_impl
+    register_kernel_impl(kernel_module)
 
-print("0. eager sanity check (prefill + one decode step)...")
-with torch.no_grad():  # no backward pass needed -- avoids retaining autograd activation buffers
-    out = model(*prefill_inputs)
-    assert out.shape == (1, args.max_prompt_len, hidden_size)
-    out2 = model(*decode_inputs)
-    assert out2.shape == (1, 1, hidden_size)
-print(f"   prefill out {tuple(out.shape)}, decode out {tuple(out2.shape)} -- OK", flush=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--arm", default="map50", choices=["map25", "map50", "map75"])
+    parser.add_argument("--max-prompt-len", type=int, default=64)
+    parser.add_argument("--real-weights", action="store_true",
+                         help="Load real pretrained meta-llama/Llama-3.2-1B (needs HF auth + ~5GB "
+                              "download) instead of random-init -- for the Colab run that produces "
+                              "the actual on-device benchmark artifact.")
+    args = parser.parse_args()
 
-print("1a. torch.export prefill (fixed shape, start_pos=0)...")
-prefill_exported = torch.export.export(model, prefill_inputs)
-check_mutation_markers(prefill_exported, "prefill")
+    arms_data = json.load(open("llama_3.2_1b_arms.json"))
+    arm = arms_data["arms"][args.arm]
+    head_windowed_per_layer = arm["head_windowed"]  # [L][n_heads] bool
+    n_layers = arms_data["n_layers"]
+    SINK, WINDOW = arms_data["sink"], arms_data["window"]
+    MAX_T = args.max_prompt_len + 256  # room for prefill + a generation run, small for this exit gate
 
-print("1b. torch.export decode (Tn=1 fixed, dynamic start_pos)...")
-decode_exported = torch.export.export(model, decode_inputs)
-check_mutation_markers(decode_exported, "decode")
-print(flush=True)
+    if args.real_weights:
+        from transformers import AutoModelForCausalLM
+        print(f"Loading real pretrained meta-llama/Llama-3.2-1B with arm={args.arm} "
+              f"({sum(sum(r) for r in head_windowed_per_layer)}/{n_layers * 32} heads windowed)...")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            "meta-llama/Llama-3.2-1B", torch_dtype=torch.float32
+        ).model.eval()
+        assert base_model.config.num_hidden_layers == n_layers, "arms JSON layer count mismatch vs. real model"
+    else:
+        print(f"Building Llama-3.2-1B (config only, random init) with arm={args.arm} "
+              f"({sum(sum(r) for r in head_windowed_per_layer)}/{n_layers * 32} heads windowed)...")
+        config = LlamaConfig(
+            vocab_size=128256, hidden_size=2048, intermediate_size=8192,
+            num_hidden_layers=n_layers, num_attention_heads=32, num_key_value_heads=8,
+            head_dim=64, max_position_embeddings=2048, rope_theta=500000.0,
+        )
+        base_model = LlamaModel(config).eval()
 
-# Free the eager model before the heaviest-memory stages (edge lowering + flatbuffer
-# serialization both build their own representation of the ~4.9GB fp32 weights on top of
-# whatever's already resident) -- best-effort peak-RAM reduction, since a real Llama-3.2-1B
-# export on a memory-constrained free-tier VM can OOM-kill silently (no Python traceback, just
-# a truncated/0-byte .pte -- exactly what happened on the first Lightning AI run).
-import gc
-del model, base_model
-gc.collect()
+    model = WindowedLlamaForExport(base_model, head_windowed_per_layer, SINK, WINDOW, MAX_T).eval()
+    vocab_size, hidden_size = base_model.config.vocab_size, base_model.config.hidden_size
 
-print("2. to_edge_transform_and_lower (both methods together)...")
-from executorch.exir import to_edge_transform_and_lower, EdgeCompileConfig
-edge_program = to_edge_transform_and_lower(
-    {"prefill": prefill_exported, "decode": decode_exported},
-    compile_config=EdgeCompileConfig(_check_ir_validity=False),
-)
-print("   to_edge OK", flush=True)
-del prefill_exported, decode_exported
-gc.collect()
+    prefill_inputs = (
+        torch.randint(0, vocab_size, (1, args.max_prompt_len)),
+        torch.zeros(1, dtype=torch.long),  # start_pos = 0, always -- prefill is a fresh generation
+    )
+    decode_inputs = (
+        torch.randint(0, vocab_size, (1, 1)),
+        torch.tensor([args.max_prompt_len], dtype=torch.long),  # example start_pos, made dynamic below
+    )
 
-print("3. to_executorch ...")
-et_program = edge_program.to_executorch()
-print(f"   to_executorch OK -- serialized buffer is {len(et_program.buffer):,} bytes", flush=True)
+    print("0. eager sanity check (prefill + one decode step)...")
+    with torch.no_grad():  # no backward pass needed -- avoids retaining autograd activation buffers
+        out = model(*prefill_inputs)
+        assert out.shape == (1, args.max_prompt_len, hidden_size)
+        out2 = model(*decode_inputs)
+        assert out2.shape == (1, 1, hidden_size)
+    print(f"   prefill out {tuple(out.shape)}, decode out {tuple(out2.shape)} -- OK", flush=True)
 
-pte_path = f"llama_3.2_1b_{args.arm}.pte"
-print(f"4. writing {pte_path} ...", flush=True)
-with open(pte_path, "wb") as f:
-    f.write(et_program.buffer)
-print(f"   wrote {pte_path} ({len(et_program.buffer):,} bytes) -- methods: prefill, decode")
-print()
-print(f"PHASE 4.4 EXPORT SURVIVAL ({args.arm}): PASSED -- full {n_layers}-layer windowed "
-      f"Llama-3.2-1B attention survives export -> edge -> .pte as two methods "
-      f"(fixed-shape prefill, dynamic-start_pos decode).")
+    print("1a. torch.export prefill (fixed shape, start_pos=0)...")
+    prefill_exported = torch.export.export(model, prefill_inputs)
+    check_mutation_markers(prefill_exported, n_layers, "prefill")
+
+    print("1b. torch.export decode (Tn=1 fixed, dynamic start_pos)...")
+    decode_exported = torch.export.export(model, decode_inputs)
+    check_mutation_markers(decode_exported, n_layers, "decode")
+    print(flush=True)
+
+    # Free the eager model before the heaviest-memory stages (edge lowering + flatbuffer
+    # serialization both build their own representation of the ~4.9GB fp32 weights on top of
+    # whatever's already resident) -- best-effort peak-RAM reduction, since a real Llama-3.2-1B
+    # export on a memory-constrained free-tier VM can OOM-kill silently (no Python traceback, just
+    # a truncated/0-byte .pte -- exactly what happened on the first Lightning AI run).
+    import gc
+    del model, base_model
+    gc.collect()
+
+    print("2. to_edge_transform_and_lower (both methods together)...")
+    from executorch.exir import to_edge_transform_and_lower, EdgeCompileConfig
+    edge_program = to_edge_transform_and_lower(
+        {"prefill": prefill_exported, "decode": decode_exported},
+        compile_config=EdgeCompileConfig(_check_ir_validity=False),
+    )
+    print("   to_edge OK", flush=True)
+    del prefill_exported, decode_exported
+    gc.collect()
+
+    print("3. to_executorch ...")
+    # share_mutable_buffers=True: prefill and decode are independently exported methods, each
+    # with its own lifted k_cache/v_cache buffer parameters. Without this, the runtime gives
+    # each method its OWN copy of those buffers (zero-initialized), so decode would silently
+    # attend over an empty cache instead of continuing from what prefill just wrote -- matches
+    # Module::Module's share_memory_arenas parameter on the runtime/C++ side (both must be set
+    # together; see extension/module/module.h's docstring on share_memory_arenas).
+    from executorch.exir.passes import MemoryPlanningPass
+    from executorch.exir import ExecutorchBackendConfig
+    et_program = edge_program.to_executorch(
+        ExecutorchBackendConfig(memory_planning_pass=MemoryPlanningPass(share_mutable_buffers=True))
+    )
+    print(f"   to_executorch OK -- serialized buffer is {len(et_program.buffer):,} bytes", flush=True)
+
+    pte_path = f"llama_3.2_1b_{args.arm}.pte"
+    print(f"4. writing {pte_path} ...", flush=True)
+    with open(pte_path, "wb") as f:
+        f.write(et_program.buffer)
+    print(f"   wrote {pte_path} ({len(et_program.buffer):,} bytes) -- methods: prefill, decode")
+    print()
+    print(f"PHASE 4.4 EXPORT SURVIVAL ({args.arm}): PASSED -- full {n_layers}-layer windowed "
+          f"Llama-3.2-1B attention survives export -> edge -> .pte as two methods "
+          f"(fixed-shape prefill, dynamic-start_pos decode).")

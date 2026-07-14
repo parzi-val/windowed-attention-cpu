@@ -20,3 +20,6 @@ build-android/
 
 # local ExecuTorch source checkout + NDK -- large build dependency, not tracked source (Phase 4)
 _build/
+
+# downloaded reference-model artifacts for control-experiment benchmarking, not tracked source
+executorch/phase4_llama/reference_baseline/

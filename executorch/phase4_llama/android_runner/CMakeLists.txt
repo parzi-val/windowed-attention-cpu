@@ -68,3 +68,43 @@ target_link_libraries(prefill_decode_runner PRIVATE
 if(ANDROID)
   target_link_libraries(prefill_decode_runner PRIVATE log)
 endif()
+
+# Control experiment: runs ExecuTorch's own official reference Llama-3.2-1B export (standard
+# SDPA + KV-cache, XNNPACK-delegated, no custom op) to determine whether our windowed_sdpa_kv_cache
+# op is the source of decode's slowness or whether that's generic to this hardware/pipeline.
+# xnnpack_backend WHOLE_ARCHIVE'd for the same reason as optimized_native_cpu_ops_lib -- its
+# backend registration is a static-initializer side effect nothing else references directly.
+# Library set matches examples/models/llama/CMakeLists.txt's own xnnpack_backend branch.
+add_executable(reference_forward_runner reference_forward_runner.cpp)
+target_include_directories(reference_forward_runner PRIVATE ${_et_inc})
+target_compile_features(reference_forward_runner PRIVATE cxx_std_20)
+target_link_libraries(reference_forward_runner PRIVATE
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}optimized_native_cpu_ops_lib${_s}>
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}xnnpack_backend${_s}>
+  # custom_ops (llama::update_cache / llama::custom_sdpa): built via a separate reconfigure with
+  # EXECUTORCH_BUILD_KERNELS_LLM=ON, so it installs to extension/llm/custom_ops/, not the
+  # aggregated lib/ directory other targets use -- confirmed via find, not guessed.
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_out}/extension/llm/custom_ops/${_p}custom_ops${_s}>
+  "${_et_lib}/${_p}extension_module_static${_s}"
+  "${_et_lib}/${_p}extension_tensor${_s}"
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}executorch${_s}>
+  "${_et_lib}/${_p}executorch_core${_s}"
+  "${_et_lib}/${_p}extension_data_loader${_s}"
+  "${_et_lib}/${_p}extension_flat_tensor${_s}"
+  "${_et_lib}/${_p}extension_named_data_map${_s}"
+  "${_et_lib}/${_p}XNNPACK${_s}"
+  "${_et_lib}/${_p}xnnpack-microkernels-prod${_s}"
+  "${_et_lib}/${_p}kleidiai${_s}"
+  "${_et_lib}/${_p}optimized_kernels${_s}"
+  "${_et_lib}/${_p}portable_kernels${_s}"
+  "${_et_lib}/${_p}cpublas${_s}"
+  "${_et_lib}/${_p}eigen_blas${_s}"
+  "${_et_lib}/${_p}extension_threadpool${_s}"
+  "${_et_lib}/${_p}pthreadpool${_s}"
+  "${_et_lib}/${_p}cpuinfo${_s}"
+  "${_et_lib}/${_p}kernels_util_all_deps${_s}"
+  "${_et_lib}/${_p}flatccrt${_s}"
+)
+if(ANDROID)
+  target_link_libraries(reference_forward_runner PRIVATE log)
+endif()

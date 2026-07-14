@@ -136,11 +136,12 @@ decode_inputs = (
 )
 
 print("0. eager sanity check (prefill + one decode step)...")
-out = model(*prefill_inputs)
-assert out.shape == (1, args.max_prompt_len, hidden_size)
-out2 = model(*decode_inputs)
-assert out2.shape == (1, 1, hidden_size)
-print(f"   prefill out {tuple(out.shape)}, decode out {tuple(out2.shape)} -- OK")
+with torch.no_grad():  # no backward pass needed -- avoids retaining autograd activation buffers
+    out = model(*prefill_inputs)
+    assert out.shape == (1, args.max_prompt_len, hidden_size)
+    out2 = model(*decode_inputs)
+    assert out2.shape == (1, 1, hidden_size)
+print(f"   prefill out {tuple(out.shape)}, decode out {tuple(out2.shape)} -- OK", flush=True)
 
 print("1a. torch.export prefill (fixed shape, start_pos=0)...")
 prefill_exported = torch.export.export(model, prefill_inputs)
@@ -149,6 +150,16 @@ check_mutation_markers(prefill_exported, "prefill")
 print("1b. torch.export decode (Tn=1 fixed, dynamic start_pos)...")
 decode_exported = torch.export.export(model, decode_inputs)
 check_mutation_markers(decode_exported, "decode")
+print(flush=True)
+
+# Free the eager model before the heaviest-memory stages (edge lowering + flatbuffer
+# serialization both build their own representation of the ~4.9GB fp32 weights on top of
+# whatever's already resident) -- best-effort peak-RAM reduction, since a real Llama-3.2-1B
+# export on a memory-constrained free-tier VM can OOM-kill silently (no Python traceback, just
+# a truncated/0-byte .pte -- exactly what happened on the first Lightning AI run).
+import gc
+del model, base_model
+gc.collect()
 
 print("2. to_edge_transform_and_lower (both methods together)...")
 from executorch.exir import to_edge_transform_and_lower, EdgeCompileConfig
@@ -156,16 +167,19 @@ edge_program = to_edge_transform_and_lower(
     {"prefill": prefill_exported, "decode": decode_exported},
     compile_config=EdgeCompileConfig(_check_ir_validity=False),
 )
-print("   to_edge OK")
+print("   to_edge OK", flush=True)
+del prefill_exported, decode_exported
+gc.collect()
 
 print("3. to_executorch ...")
 et_program = edge_program.to_executorch()
-print("   to_executorch OK")
+print(f"   to_executorch OK -- serialized buffer is {len(et_program.buffer):,} bytes", flush=True)
 
 pte_path = f"llama_3.2_1b_{args.arm}.pte"
+print(f"4. writing {pte_path} ...", flush=True)
 with open(pte_path, "wb") as f:
     f.write(et_program.buffer)
-print(f"4. wrote {pte_path} ({len(et_program.buffer):,} bytes) -- methods: prefill, decode")
+print(f"   wrote {pte_path} ({len(et_program.buffer):,} bytes) -- methods: prefill, decode")
 print()
 print(f"PHASE 4.4 EXPORT SURVIVAL ({args.arm}): PASSED -- full {n_layers}-layer windowed "
       f"Llama-3.2-1B attention survives export -> edge -> .pte as two methods "

@@ -31,6 +31,7 @@
 
 #include <executorch/extension/module/module.h>
 #include <executorch/extension/tensor/tensor.h>
+#include <executorch/extension/threadpool/threadpool.h>
 
 using executorch::aten::ScalarType;
 using executorch::extension::from_blob;
@@ -60,12 +61,28 @@ int main(int argc, char** argv) {
   tin.read(reinterpret_cast<char*>(&prefill_len), sizeof(int64_t));
   std::cout << "loaded " << n_tokens << " tokens, prefill_len=" << prefill_len << "\n";
 
+  auto* pool = executorch::extension::threadpool::get_threadpool();
+  std::cout << "threadpool thread count: " << (pool ? pool->get_thread_count() : 0) << "\n";
+
   std::cout << "loading module (mmap) from " << pte_path << " ...\n";
   // share_memory_arenas=true: required so prefill and decode -- independently exported
   // methods -- share the same underlying k_cache/v_cache buffers at runtime instead of each
   // getting its own zero-initialized copy (must match share_mutable_buffers=True on the export
   // side; see export_llama.py's to_executorch() call for the full explanation).
-  Module module(pte_path, Module::LoadMode::Mmap, nullptr, nullptr, nullptr, /*share_memory_arenas=*/true);
+  //
+  // Mmap, not File or MmapUseMlockIgnoreErrors: both were tried to test whether decode's
+  // ~27s/step is caused by mmap page eviction/re-faulting from storage under memory pressure.
+  // MmapUseMlockIgnoreErrors made no difference (inconclusive -- Android's RLIMIT_MEMLOCK for
+  // regular processes is typically tiny, a few MB at most, so mlock() on a 4.9GB region almost
+  // certainly failed silently and never actually locked anything). LoadMode::File definitively
+  // ruled the hypothesis out: loading the whole 4.9GB into a plain malloc'd buffer (no eviction
+  // possible at all) left decode just as slow (~21-35s/step) and made prefill WORSE (75s vs.
+  // 27-32s, plus the up-front contiguous-allocation risk) -- so plain Mmap is strictly better
+  // with no correctness or speed cost. The real bottleneck is upstream of the loading mechanism
+  // (GEMV memory bandwidth and/or per-call dispatch overhead) -- see the quantization work this
+  // is blocked on, since reducing bytes-per-weight helps regardless of the exact cause.
+  Module module(pte_path, Module::LoadMode::Mmap, nullptr, nullptr, nullptr,
+                /*share_memory_arenas=*/true);
   auto load_err = module.load();
   if (load_err != executorch::runtime::Error::Ok) {
     std::cerr << "module.load() failed: " << static_cast<int>(load_err) << "\n";

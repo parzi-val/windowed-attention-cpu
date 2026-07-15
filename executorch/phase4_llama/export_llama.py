@@ -169,10 +169,29 @@ if __name__ == "__main__":
     del model, base_model
     gc.collect()
 
-    print("2. to_edge_transform_and_lower (both methods together)...")
+    print("2. to_edge_transform_and_lower (both methods, XNNPACK-delegated)...")
+    # XnnpackDynamicallyQuantizedPartitioner(), matching the reference model's own recipe
+    # (ExportRecipe_1B.ipynb uses -X alone, no --xnnpack-extended-ops). windowed_sdpa_kv_cache
+    # isn't an op XNNPACK recognizes, so it stays a regular CPU-executed node regardless.
+    #
+    # Requires FLATC_EXECUTABLE set to a real flatc binary -- the pip-installed executorch
+    # package doesn't bundle one for Windows (_get_flatc_path() falls back to bare "flatc" on
+    # PATH, which isn't there). Without this, to_edge_transform_and_lower segfaults on the full
+    # 16-layer model (FileNotFoundError on a single real layer during bisection revealed the
+    # same missing-flatc cause; the crash mode just differs by graph size).
+    import os
+    if "FLATC_EXECUTABLE" not in os.environ:
+        raise RuntimeError(
+            "FLATC_EXECUTABLE must be set to a real flatc binary for XNNPACK export -- e.g. "
+            "_build/executorch/cmake-out-desktop/third-party/flatc_ep/bin/flatc.exe"
+        )
+    from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+        XnnpackDynamicallyQuantizedPartitioner,
+    )
     from executorch.exir import to_edge_transform_and_lower, EdgeCompileConfig
     edge_program = to_edge_transform_and_lower(
         {"prefill": prefill_exported, "decode": decode_exported},
+        partitioner=[XnnpackDynamicallyQuantizedPartitioner()],
         compile_config=EdgeCompileConfig(_check_ir_validity=False),
     )
     print("   to_edge OK", flush=True)

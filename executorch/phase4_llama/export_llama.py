@@ -174,17 +174,23 @@ if __name__ == "__main__":
     # (ExportRecipe_1B.ipynb uses -X alone, no --xnnpack-extended-ops). windowed_sdpa_kv_cache
     # isn't an op XNNPACK recognizes, so it stays a regular CPU-executed node regardless.
     #
-    # Requires FLATC_EXECUTABLE set to a real flatc binary -- the pip-installed executorch
-    # package doesn't bundle one for Windows (_get_flatc_path() falls back to bare "flatc" on
-    # PATH, which isn't there). Without this, to_edge_transform_and_lower segfaults on the full
-    # 16-layer model (FileNotFoundError on a single real layer during bisection revealed the
-    # same missing-flatc cause; the crash mode just differs by graph size).
+    # Needs a real, resolvable flatc binary -- the pip-installed executorch package doesn't
+    # bundle one for Windows (_get_flatc_path() falls back to bare "flatc" on PATH, which isn't
+    # there, surfacing as a crash deep inside XNNPACK serialization). Linux wheels (Colab,
+    # Kaggle) likely bundle a working one via importlib.resources, so only require
+    # FLATC_EXECUTABLE as a fallback if the package's own resolution comes up empty -- don't
+    # assume Windows's gap applies everywhere.
     import os
-    if "FLATC_EXECUTABLE" not in os.environ:
-        raise RuntimeError(
-            "FLATC_EXECUTABLE must be set to a real flatc binary for XNNPACK export -- e.g. "
-            "_build/executorch/cmake-out-desktop/third-party/flatc_ep/bin/flatc.exe"
-        )
+    import shutil
+    from executorch.exir._serialize._flatbuffer import _get_flatc_path
+    resolved_flatc = _get_flatc_path()
+    if not (os.path.isfile(resolved_flatc) or shutil.which(resolved_flatc)):
+        if "FLATC_EXECUTABLE" not in os.environ:
+            raise RuntimeError(
+                f"No usable flatc found (resolved to {resolved_flatc!r}, not found on disk or "
+                "PATH) and FLATC_EXECUTABLE is not set. Set it to a real flatc binary -- e.g. "
+                "_build/executorch/cmake-out-desktop/third-party/flatc_ep/bin/flatc.exe"
+            )
     from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
         XnnpackDynamicallyQuantizedPartitioner,
     )

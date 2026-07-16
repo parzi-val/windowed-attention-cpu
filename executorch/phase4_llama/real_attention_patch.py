@@ -117,10 +117,20 @@ class RealWindowedLlamaAttention(nn.Module):
         k = repeat_kv(k, self.n_rep)
         v = repeat_kv(v, self.n_rep)
 
+        # The native kernel is fp32-only (C++ float*, pybind py::array_t<float>) -- when the
+        # surrounding model runs in bf16 (Phase 4.7, for the ~2x memory-bandwidth win), q/k/v
+        # arrive here as bf16. Casting straight through would either error in eager mode (numpy
+        # has no native bf16) or, at the exported native-kernel boundary, silently reinterpret
+        # 2-byte bf16 elements as 4-byte floats -- garbage output, not a crash. Cast to fp32
+        # right before the op and back to the model's dtype right after; k_cache/v_cache stay
+        # fp32 (register_buffer's torch.zeros defaults to the global dtype, fp32, regardless of
+        # the surrounding model's dtype) since the kernel only ever touches them as float*.
+        orig_dtype = q.dtype
         out = torch.ops.sg.windowed_sdpa_kv_cache(
-            q, k, v, self.k_cache, self.v_cache, self.head_windowed,
+            q.float(), k.float(), v.float(), self.k_cache, self.v_cache, self.head_windowed,
             self.sink, self.window, start_pos,
         )
+        out = out.to(orig_dtype)
         out = out.transpose(1, 2).contiguous().view(bsz, q_len, -1)
         return (self.original_attn.o_proj(out), None)
 

@@ -48,6 +48,13 @@ target_compile_features(prefill_decode_runner PRIVATE cxx_std_20)
 target_link_libraries(prefill_decode_runner PRIVATE
   $<LINK_LIBRARY:WHOLE_ARCHIVE,windowed_sdpa_kv_cache_et_rt>
   $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}optimized_native_cpu_ops_lib${_s}>
+  # XNNPACK backend, added for Phase 4.6 -- our own real export now uses
+  # XnnpackDynamicallyQuantizedPartitioner, so its delegated subgraphs need this backend
+  # registered at runtime, same static-initializer WHOLE_ARCHIVE reasoning as the op libs.
+  # No custom_ops here (that library is specific to the *reference* model's own
+  # llama::update_cache/custom_sdpa ops in reference_forward_runner's target below -- our model
+  # uses windowed_sdpa_kv_cache instead).
+  $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}xnnpack_backend${_s}>
   "${_et_lib}/${_p}extension_module_static${_s}"
   "${_et_lib}/${_p}extension_tensor${_s}"
   $<LINK_LIBRARY:WHOLE_ARCHIVE,${_et_lib}/${_p}executorch${_s}>
@@ -55,6 +62,9 @@ target_link_libraries(prefill_decode_runner PRIVATE
   "${_et_lib}/${_p}extension_data_loader${_s}"
   "${_et_lib}/${_p}extension_flat_tensor${_s}"
   "${_et_lib}/${_p}extension_named_data_map${_s}"
+  "${_et_lib}/${_p}XNNPACK${_s}"
+  "${_et_lib}/${_p}xnnpack-microkernels-prod${_s}"
+  "${_et_lib}/${_p}kleidiai${_s}"
   "${_et_lib}/${_p}optimized_kernels${_s}"
   "${_et_lib}/${_p}portable_kernels${_s}"
   "${_et_lib}/${_p}cpublas${_s}"

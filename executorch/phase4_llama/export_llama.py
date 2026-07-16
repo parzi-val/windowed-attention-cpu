@@ -113,23 +113,29 @@ if __name__ == "__main__":
     SINK, WINDOW = arms_data["sink"], arms_data["window"]
     MAX_T = args.max_prompt_len + 256  # room for prefill + a generation run, small for this exit gate
 
+    # bf16, not fp32: matches the reference model's own export recipe (-d bf16), halves the
+    # .pte size (2.5GB vs 4.9GB) and halves memory-bandwidth per weight -- decode is GEMV
+    # (bandwidth-bound, established in the earlier mmap-eviction investigation), so this should
+    # help decode speed on top of whatever XNNPACK delegation buys, not just shrink the file.
+    # windowed_sdpa_kv_cache itself stays fp32 internally (RealWindowedLlamaAttention casts
+    # around the op call) since the native kernel is fp32-only.
     if args.real_weights:
         from transformers import AutoModelForCausalLM
-        print(f"Loading real pretrained meta-llama/Llama-3.2-1B with arm={args.arm} "
+        print(f"Loading real pretrained meta-llama/Llama-3.2-1B (bf16) with arm={args.arm} "
               f"({sum(sum(r) for r in head_windowed_per_layer)}/{n_layers * 32} heads windowed)...")
         base_model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.2-1B", torch_dtype=torch.float32
+            "meta-llama/Llama-3.2-1B", torch_dtype=torch.bfloat16
         ).model.eval()
         assert base_model.config.num_hidden_layers == n_layers, "arms JSON layer count mismatch vs. real model"
     else:
-        print(f"Building Llama-3.2-1B (config only, random init) with arm={args.arm} "
+        print(f"Building Llama-3.2-1B (config only, random init, bf16) with arm={args.arm} "
               f"({sum(sum(r) for r in head_windowed_per_layer)}/{n_layers * 32} heads windowed)...")
         config = LlamaConfig(
             vocab_size=128256, hidden_size=2048, intermediate_size=8192,
             num_hidden_layers=n_layers, num_attention_heads=32, num_key_value_heads=8,
             head_dim=64, max_position_embeddings=2048, rope_theta=500000.0,
         )
-        base_model = LlamaModel(config).eval()
+        base_model = LlamaModel(config).to(torch.bfloat16).eval()
 
     model = WindowedLlamaForExport(base_model, head_windowed_per_layer, SINK, WINDOW, MAX_T).eval()
     vocab_size, hidden_size = base_model.config.vocab_size, base_model.config.hidden_size

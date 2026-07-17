@@ -104,7 +104,14 @@ if __name__ == "__main__":
                          help="Load real pretrained meta-llama/Llama-3.2-1B (needs HF auth + ~5GB "
                               "download) instead of random-init -- for the Colab run that produces "
                               "the actual on-device benchmark artifact.")
+    parser.add_argument("--dtype", default="fp32", choices=["fp32", "bf16"],
+                         help="fp32 (default): larger .pte (4.9GB) but XNNPACK actually delegates "
+                              "the matmuls -- confirmed via diagnose_delegation.py, bf16 leaves all "
+                              "112 mm ops on plain CPU (this pip executorch's XNNPACK partitioner "
+                              "won't delegate bf16 matmuls). bf16: 2.5GB but no matmul delegation, "
+                              "so decode stays slow -- kept only for size experiments.")
     args = parser.parse_args()
+    torch_dtype = torch.float32 if args.dtype == "fp32" else torch.bfloat16
 
     arms_data = json.load(open("llama_3.2_1b_arms.json"))
     arm = arms_data["arms"][args.arm]
@@ -113,29 +120,30 @@ if __name__ == "__main__":
     SINK, WINDOW = arms_data["sink"], arms_data["window"]
     MAX_T = args.max_prompt_len + 256  # room for prefill + a generation run, small for this exit gate
 
-    # bf16, not fp32: matches the reference model's own export recipe (-d bf16), halves the
-    # .pte size (2.5GB vs 4.9GB) and halves memory-bandwidth per weight -- decode is GEMV
-    # (bandwidth-bound, established in the earlier mmap-eviction investigation), so this should
-    # help decode speed on top of whatever XNNPACK delegation buys, not just shrink the file.
-    # windowed_sdpa_kv_cache itself stays fp32 internally (RealWindowedLlamaAttention casts
-    # around the op call) since the native kernel is fp32-only.
+    # dtype defaults to fp32 -- counterintuitively the FASTER choice for decode here, despite
+    # the 2x-larger file. diagnose_delegation.py proved this pip executorch's XNNPACK partitioner
+    # delegates every matmul in fp32 (0 mm left on CPU) but NONE in bf16 (all 112 mm fall back to
+    # plain CPU), and the matmuls ARE the decode compute cost -- so fp32's delegated-matmul path
+    # beats bf16's undelegated one on-device even though bf16 halves memory bandwidth. bf16 stays
+    # available (--dtype bf16) for size experiments. windowed_sdpa_kv_cache is fp32-only either
+    # way (RealWindowedLlamaAttention casts around the op; a no-op when already fp32).
     if args.real_weights:
         from transformers import AutoModelForCausalLM
-        print(f"Loading real pretrained meta-llama/Llama-3.2-1B (bf16) with arm={args.arm} "
+        print(f"Loading real pretrained meta-llama/Llama-3.2-1B ({args.dtype}) with arm={args.arm} "
               f"({sum(sum(r) for r in head_windowed_per_layer)}/{n_layers * 32} heads windowed)...")
         base_model = AutoModelForCausalLM.from_pretrained(
-            "meta-llama/Llama-3.2-1B", torch_dtype=torch.bfloat16
+            "meta-llama/Llama-3.2-1B", torch_dtype=torch_dtype
         ).model.eval()
         assert base_model.config.num_hidden_layers == n_layers, "arms JSON layer count mismatch vs. real model"
     else:
-        print(f"Building Llama-3.2-1B (config only, random init, bf16) with arm={args.arm} "
+        print(f"Building Llama-3.2-1B (config only, random init, {args.dtype}) with arm={args.arm} "
               f"({sum(sum(r) for r in head_windowed_per_layer)}/{n_layers * 32} heads windowed)...")
         config = LlamaConfig(
             vocab_size=128256, hidden_size=2048, intermediate_size=8192,
             num_hidden_layers=n_layers, num_attention_heads=32, num_key_value_heads=8,
             head_dim=64, max_position_embeddings=2048, rope_theta=500000.0,
         )
-        base_model = LlamaModel(config).to(torch.bfloat16).eval()
+        base_model = LlamaModel(config).to(torch_dtype).eval()
 
     model = WindowedLlamaForExport(base_model, head_windowed_per_layer, SINK, WINDOW, MAX_T).eval()
     vocab_size, hidden_size = base_model.config.vocab_size, base_model.config.hidden_size
@@ -176,9 +184,15 @@ if __name__ == "__main__":
     gc.collect()
 
     print("2. to_edge_transform_and_lower (both methods, XNNPACK-delegated)...")
-    # XnnpackDynamicallyQuantizedPartitioner(), matching the reference model's own recipe
-    # (ExportRecipe_1B.ipynb uses -X alone, no --xnnpack-extended-ops). windowed_sdpa_kv_cache
-    # isn't an op XNNPACK recognizes, so it stays a regular CPU-executed node regardless.
+    # Plain XnnpackPartitioner(), not XnnpackDynamicallyQuantizedPartitioner(): the DQ-only
+    # variant only delegates dynamically-QUANTIZED linear ops, and our model isn't quantized
+    # (just bf16) -- confirmed empirically, since a full bf16+DQ-partitioner on-device run came
+    # back barely faster than plain bf16 with no delegation at all (~14-19s/decode-step vs.
+    # ~25-30s fp32), nowhere near the reference's 700-1150ms. That gap is consistent with the DQ
+    # partitioner delegating ~nothing for us, meaning the earlier segfaults were never really
+    # about "DQ vs plain" -- they were flatc + memory pressure (both fixed since), so it's worth
+    # retrying the partitioner that actually delegates real ops. windowed_sdpa_kv_cache isn't an
+    # op XNNPACK recognizes either way, so it stays a regular CPU-executed node regardless.
     #
     # Needs a real, resolvable flatc binary -- the pip-installed executorch package doesn't
     # bundle one for Windows (_get_flatc_path() falls back to bare "flatc" on PATH, which isn't
@@ -197,13 +211,11 @@ if __name__ == "__main__":
                 "PATH) and FLATC_EXECUTABLE is not set. Set it to a real flatc binary -- e.g. "
                 "_build/executorch/cmake-out-desktop/third-party/flatc_ep/bin/flatc.exe"
             )
-    from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
-        XnnpackDynamicallyQuantizedPartitioner,
-    )
+    from executorch.backends.xnnpack.partition.xnnpack_partitioner import XnnpackPartitioner
     from executorch.exir import to_edge_transform_and_lower, EdgeCompileConfig
     edge_program = to_edge_transform_and_lower(
         {"prefill": prefill_exported, "decode": decode_exported},
-        partitioner=[XnnpackDynamicallyQuantizedPartitioner()],
+        partitioner=[XnnpackPartitioner()],
         compile_config=EdgeCompileConfig(_check_ir_validity=False),
     )
     print("   to_edge OK", flush=True)
